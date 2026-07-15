@@ -55,7 +55,7 @@ jobs:
           DRIVE_FOLDER_ID: ${{ inputs.drive_folder_id }}
           TOKEN_FILE: token.json
           STORAGE_STATE_FILE: storage_state.json
-        run: python scripts/reels_pipeline.py
+        run: python reels.py
 
       - name: Upload run CSVs as artifact
         if: always()
