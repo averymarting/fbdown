@@ -3,11 +3,14 @@
 Headless pipeline for GitHub Actions (no GUI):
   1. Scrape Facebook Reels tab URL(s) with Playwright (headless Chromium)
   2. Download found reels with yt-dlp
-  3. Upload downloaded videos to a Google Drive folder
+  3. Upload downloaded videos to a Mega.nz folder via rclone
 
-Reads two credential files, written by the workflow from two GitHub Secrets:
-  - token.json           -> Google Drive OAuth token (same shape used by gdrive_uploader.py)
+Reads one credential file, written by the workflow from a GitHub Secret:
   - storage_state.json   -> Facebook Playwright storage_state (cookies + origins)
+
+Mega.nz credentials are handled entirely by rclone's own config file
+(~/.config/rclone/rclone.conf), which the workflow writes from the
+RCLONE_CONF GitHub Secret. This script never sees the Mega password.
 
 All run parameters come from environment variables set by the workflow_dispatch inputs.
 """
@@ -17,26 +20,18 @@ import sys
 import csv
 import json
 import time
-import mimetypes
 import subprocess
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v'}
 
 # ---- config from environment / workflow inputs ----
-REEL_URLS       = [u.strip() for u in os.environ.get("REEL_URLS", "").splitlines()
-                    if u.strip() and not u.strip().startswith("#")]
+REEL_URLS        = [u.strip() for u in os.environ.get("REEL_URLS", "").splitlines()
+                     if u.strip() and not u.strip().startswith("#")]
 MAX_SCROLLS      = int(os.environ.get("MAX_SCROLLS", "2"))
 FOLDER_NAME      = os.environ.get("FOLDER_NAME", "facebook_reels")
-DRIVE_FOLDER_ID  = os.environ.get("DRIVE_FOLDER_ID", "").strip()
-TOKEN_FILE       = os.environ.get("TOKEN_FILE", "token.json")
 STORAGE_STATE    = os.environ.get("STORAGE_STATE_FILE", "storage_state.json")
 COOKIES_TXT      = "fb_cookies.txt"
 OUTPUT_DIR       = os.path.join("output", FOLDER_NAME)
@@ -45,6 +40,10 @@ MAX_RETRIES      = int(os.environ.get("MAX_RETRIES", "3"))
 RETRY_DELAYS     = [10, 30, 60]
 MAX_CONSEC_FAIL  = 5
 COOLDOWN_SLEEP   = 90
+
+# Mega / rclone config
+MEGA_REMOTE      = os.environ.get("MEGA_REMOTE", "mega").strip()      # name of the [remote] in rclone.conf
+MEGA_FOLDER_NAME = os.environ.get("MEGA_FOLDER_NAME", "").strip() or FOLDER_NAME
 
 
 def log(msg):
@@ -188,52 +187,40 @@ def download_links(links, cookies_txt):
     return failed
 
 
-# ---------------- upload (Google Drive) ----------------
-def load_drive_creds(token_file):
-    with open(token_file) as f:
-        info = json.load(f)
-    creds = Credentials(
-        token=info.get("token"),
-        refresh_token=info.get("refresh_token"),
-        token_uri=info.get("token_uri", "https://oauth2.googleapis.com/token"),
-        client_id=info.get("client_id"),
-        client_secret=info.get("client_secret"),
-        scopes=info.get("scopes", ["https://www.googleapis.com/auth/drive"]),
-    )
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    return creds
-
-
-def upload_file(service, fp: Path, folder_id: str):
-    mime, _ = mimetypes.guess_type(str(fp))
-    mime = mime or "application/octet-stream"
-    file_meta = {"name": fp.name, "parents": [folder_id]}
-    media = MediaFileUpload(str(fp), mimetype=mime, resumable=True, chunksize=8 * 1024 * 1024)
-    request = service.files().create(body=file_meta, media_body=media, fields="id")
-    response = None
-    while response is None:
-        _, response = request.next_chunk()
-    return response
-
-
-def upload_all(folder_id):
-    if not folder_id:
-        log("no DRIVE_FOLDER_ID provided, skipping upload")
+# ---------------- upload (Mega.nz via rclone) ----------------
+def upload_all_mega():
+    if not MEGA_FOLDER_NAME:
+        log("no MEGA_FOLDER_NAME provided, skipping upload")
         return
-    creds = load_drive_creds(TOKEN_FILE)
-    service = build("drive", "v3", credentials=creds)
 
     files = [f for f in sorted(Path(OUTPUT_DIR).iterdir())
              if f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS]
-    log(f"uploading {len(files)} video(s) to Drive folder {folder_id}")
-    for i, fp in enumerate(files, 1):
-        try:
-            log(f"[{i}/{len(files)}] uploading {fp.name}")
-            upload_file(service, fp, folder_id)
-            log(f"   done: {fp.name}")
-        except Exception as e:
-            log(f"   error uploading {fp.name}: {e}")
+
+    if not files:
+        log("no video files found to upload")
+        return
+
+    dest = f"{MEGA_REMOTE}:{MEGA_FOLDER_NAME}"
+    log(f"uploading {len(files)} video(s) to Mega folder '{dest}' via rclone")
+
+    args = [
+        "rclone", "copy", OUTPUT_DIR, dest,
+        "--include", "*.{mp4,mkv,avi,mov,wmv,flv,webm,m4v}",
+        "--transfers", "2",
+        "--retries", "3",
+        "--low-level-retries", "5",
+        "-v",
+    ]
+
+    proc = subprocess.run(args, capture_output=True, text=True)
+    if proc.stdout:
+        log(proc.stdout[-4000:])
+    if proc.returncode != 0:
+        if proc.stderr:
+            log(proc.stderr[-4000:])
+        log(f"rclone upload failed (exit {proc.returncode})")
+    else:
+        log("upload to Mega complete")
 
 
 # ---------------- main ----------------
@@ -283,7 +270,7 @@ def main():
     log(f"master csv saved: {csv_path} ({len(all_links)} reels)")
 
     download_links(all_links, cookies_txt)
-    upload_all(DRIVE_FOLDER_ID)
+    upload_all_mega()
 
 
 if __name__ == "__main__":
