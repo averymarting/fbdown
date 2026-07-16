@@ -1,35 +1,33 @@
-name: Facebook Reels -> Google Drive
-
+name: Facebook Reels -> Mega.nz
 on:
   workflow_dispatch:
     inputs:
-      drive_folder_id:
-        description: "Google Drive folder ID to upload downloaded reels to"
-        required: true
-        type: string
       reel_urls:
         description: "Facebook Reels tab URL(s), one per line"
         required: true
         type: string
         default: "https://www.facebook.com/profile.php?id=61573238759323&sk=reels_tab"
       folder_name:
-        description: "Output folder name for this run"
+        description: "Local output folder name for this run"
         required: false
         default: "facebook_reels"
+        type: string
+      mega_folder_name:
+        description: "Destination folder name on Mega.nz (defaults to folder_name if left blank)"
+        required: false
+        default: ""
         type: string
       max_scrolls:
         description: "How many times to scroll each reels tab"
         required: false
         default: "2"
         type: string
-
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -37,23 +35,29 @@ jobs:
       - name: Install Python deps
         run: |
           pip install --upgrade pip
-          pip install playwright google-auth google-auth-oauthlib google-api-python-client yt-dlp
+          pip install playwright yt-dlp
 
       - name: Install Playwright browser
         run: playwright install --with-deps chromium
 
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+
       - name: Write secrets to disk
         run: |
-          echo '${{ secrets.GDRIVE_TOKEN_JSON }}' > token.json
           echo '${{ secrets.FB_STORAGE_STATE }}' > storage_state.json
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s\n' "${{ secrets.RCLONE_CONF }}" > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
 
       - name: Run pipeline
         env:
           REEL_URLS: ${{ inputs.reel_urls }}
           MAX_SCROLLS: ${{ inputs.max_scrolls }}
           FOLDER_NAME: ${{ inputs.folder_name }}
-          DRIVE_FOLDER_ID: ${{ inputs.drive_folder_id }}
-          TOKEN_FILE: token.json
+          MEGA_FOLDER_NAME: ${{ inputs.mega_folder_name }}
+          MEGA_REMOTE: mega
           STORAGE_STATE_FILE: storage_state.json
         run: python reels.py
 
@@ -68,4 +72,4 @@ jobs:
 
       - name: Clean up secret files
         if: always()
-        run: rm -f token.json storage_state.json fb_cookies.txt
+        run: rm -f storage_state.json fb_cookies.txt "$HOME/.config/rclone/rclone.conf"
