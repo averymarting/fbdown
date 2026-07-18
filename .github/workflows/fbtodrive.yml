@@ -1,12 +1,18 @@
 name: Facebook Reels -> Mega.nz
+
 on:
   workflow_dispatch:
     inputs:
-      reel_urls:
-        description: "Facebook Reels tab URL(s), one per line"
-        required: true
+      sheet_id:
+        description: "Google Sheet ID holding the URL tabs (every tab in the sheet is read)"
+        required: false
+        default: "1pbH8zo8kAV2Gy_N5kfeuTWAKHrqAqXXu76o5XvkxiMQ"
         type: string
-        default: "https://www.facebook.com/profile.php?id=61573238759323&sk=reels_tab"
+      reel_urls:
+        description: "Fallback: Facebook Reels tab URL(s), one per line (used only if sheet_id is blank or unreadable)"
+        required: false
+        default: ""
+        type: string
       folder_name:
         description: "Local output folder name for this run"
         required: false
@@ -22,12 +28,14 @@ on:
         required: false
         default: "2"
         type: string
+
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -35,7 +43,7 @@ jobs:
       - name: Install Python deps
         run: |
           pip install --upgrade pip
-          pip install playwright yt-dlp
+          pip install playwright yt-dlp google-api-python-client google-auth google-auth-httplib2
 
       - name: Install Playwright browser
         run: playwright install --with-deps chromium
@@ -53,6 +61,8 @@ jobs:
 
       - name: Run pipeline
         env:
+          SHEET_ID: ${{ inputs.sheet_id }}
+          GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
           REEL_URLS: ${{ inputs.reel_urls }}
           MAX_SCROLLS: ${{ inputs.max_scrolls }}
           FOLDER_NAME: ${{ inputs.folder_name }}
