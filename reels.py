@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """
 Headless pipeline for GitHub Actions (no GUI):
-  1. Scrape Facebook Reels tab URL(s) with Playwright (headless Chromium)
-  2. Download found reels with yt-dlp
-  3. Upload downloaded videos to a Mega.nz folder via rclone
+  1. Pull Facebook Reels tab URL(s) from a Google Sheet (every tab = a batch of URLs)
+  2. Scrape each Reels tab URL with Playwright (headless Chromium)
+  3. Download found reels with yt-dlp
+  4. Upload downloaded videos to a Mega.nz folder via rclone
 
-Reads one credential file, written by the workflow from a GitHub Secret:
+Credential files, written by the workflow from GitHub Secrets:
   - storage_state.json   -> Facebook Playwright storage_state (cookies + origins)
+  - GOOGLE_TOKEN_JSON env var -> Google OAuth token (installed-app style: token,
+    refresh_token, token_uri, client_id, client_secret, scopes)
 
 Mega.nz credentials are handled entirely by rclone's own config file
 (~/.config/rclone/rclone.conf), which the workflow writes from the
 RCLONE_CONF GitHub Secret. This script never sees the Mega password.
 
 All run parameters come from environment variables set by the workflow_dispatch inputs.
+
+SECURITY NOTE: never hardcode or print the contents of GOOGLE_TOKEN_JSON,
+storage_state.json, or rclone.conf. They are read from disk/env only.
 """
 import os
 import re
@@ -28,26 +34,83 @@ from playwright.sync_api import sync_playwright
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v'}
 
 # ---- config from environment / workflow inputs ----
-REEL_URLS        = [u.strip() for u in os.environ.get("REEL_URLS", "").splitlines()
-                     if u.strip() and not u.strip().startswith("#")]
-MAX_SCROLLS      = int(os.environ.get("MAX_SCROLLS", "2"))
-FOLDER_NAME      = os.environ.get("FOLDER_NAME", "facebook_reels")
-STORAGE_STATE    = os.environ.get("STORAGE_STATE_FILE", "storage_state.json")
-COOKIES_TXT      = "fb_cookies.txt"
-OUTPUT_DIR       = os.path.join("output", FOLDER_NAME)
-BASE_SLEEP       = int(os.environ.get("BASE_SLEEP", "3"))
-MAX_RETRIES      = int(os.environ.get("MAX_RETRIES", "3"))
-RETRY_DELAYS     = [10, 30, 60]
-MAX_CONSEC_FAIL  = 5
-COOLDOWN_SLEEP   = 90
+REEL_URLS_ENV     = [u.strip() for u in os.environ.get("REEL_URLS", "").splitlines()
+                      if u.strip() and not u.strip().startswith("#")]
+MAX_SCROLLS       = int(os.environ.get("MAX_SCROLLS", "2"))
+FOLDER_NAME       = os.environ.get("FOLDER_NAME", "facebook_reels")
+STORAGE_STATE     = os.environ.get("STORAGE_STATE_FILE", "storage_state.json")
+COOKIES_TXT       = "fb_cookies.txt"
+OUTPUT_DIR        = os.path.join("output", FOLDER_NAME)
+BASE_SLEEP        = int(os.environ.get("BASE_SLEEP", "3"))
+MAX_RETRIES       = int(os.environ.get("MAX_RETRIES", "3"))
+RETRY_DELAYS      = [10, 30, 60]
+MAX_CONSEC_FAIL   = 5
+COOLDOWN_SLEEP    = 90
+
+# Google Sheet source (each tab in the sheet = a list of Facebook reels-tab URLs in column A)
+SHEET_ID          = os.environ.get("SHEET_ID", "").strip()
+GOOGLE_TOKEN_JSON = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
 
 # Mega / rclone config
-MEGA_REMOTE      = os.environ.get("MEGA_REMOTE", "mega").strip()      # name of the [remote] in rclone.conf
-MEGA_FOLDER_NAME = os.environ.get("MEGA_FOLDER_NAME", "").strip() or FOLDER_NAME
+MEGA_REMOTE       = os.environ.get("MEGA_REMOTE", "mega").strip()      # name of the [remote] in rclone.conf
+MEGA_FOLDER_NAME  = os.environ.get("MEGA_FOLDER_NAME", "").strip() or FOLDER_NAME
 
 
 def log(msg):
     print(msg, flush=True)
+
+
+# ---------------- Google Sheet URL source ----------------
+def get_reel_urls_from_sheet(sheet_id, token_json_str):
+    """Reads every tab of the given spreadsheet and pulls Facebook URLs from column A.
+    Returns a deduped, order-preserving list combined across all tabs."""
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
+
+    info = json.loads(token_json_str)
+    creds = Credentials(
+        token=info.get("token"),
+        refresh_token=info.get("refresh_token"),
+        token_uri=info.get("token_uri", "https://oauth2.googleapis.com/token"),
+        client_id=info.get("client_id"),
+        client_secret=info.get("client_secret"),
+        scopes=info.get("scopes") or ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    )
+
+    if not creds.valid:
+        creds.refresh(Request())
+
+    service = build("sheets", "v4", credentials=creds)
+    meta = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+    tab_titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+    log(f"found {len(tab_titles)} tab(s) in sheet: {', '.join(tab_titles)}")
+
+    urls = []
+    seen = set()
+    for title in tab_titles:
+        rng = f"'{title}'!A:A"
+        try:
+            resp = service.spreadsheets().values().get(
+                spreadsheetId=sheet_id, range=rng
+            ).execute()
+        except Exception as e:
+            log(f"   could not read tab '{title}': {e}")
+            continue
+
+        rows = resp.get("values", [])
+        added = 0
+        for row in rows:
+            if not row:
+                continue
+            val = row[0].strip()
+            if val.lower().startswith("http") and "facebook.com" in val and val not in seen:
+                seen.add(val)
+                urls.append(val)
+                added += 1
+        log(f"   tab '{title}': {added} url(s)")
+
+    return urls
 
 
 # ---------------- cookies (for yt-dlp) ----------------
@@ -225,8 +288,24 @@ def upload_all_mega():
 
 # ---------------- main ----------------
 def main():
-    if not REEL_URLS:
-        log("no REEL_URLS provided, exiting")
+    # Prefer the Google Sheet as the URL source when configured; fall back to
+    # the REEL_URLS workflow input otherwise.
+    reel_urls = []
+    if SHEET_ID and GOOGLE_TOKEN_JSON:
+        log(f"reading reel URLs from Google Sheet {SHEET_ID}")
+        try:
+            reel_urls = get_reel_urls_from_sheet(SHEET_ID, GOOGLE_TOKEN_JSON)
+        except Exception as e:
+            log(f"failed to read Google Sheet: {e}")
+        log(f"total URLs from sheet: {len(reel_urls)}")
+    elif SHEET_ID and not GOOGLE_TOKEN_JSON:
+        log("SHEET_ID set but GOOGLE_TOKEN_JSON is missing, skipping sheet read")
+
+    if not reel_urls:
+        reel_urls = REEL_URLS_ENV
+
+    if not reel_urls:
+        log("no reel URLs found (sheet empty and REEL_URLS empty), exiting")
         sys.exit(1)
 
     cookies_txt = None
@@ -244,8 +323,8 @@ def main():
         context = browser.new_context(storage_state=state_arg, viewport={"width": 1400, "height": 1000})
         page = context.new_page()
 
-        for idx, url in enumerate(REEL_URLS, 1):
-            log(f"[{idx}/{len(REEL_URLS)}] scraping {url}")
+        for idx, url in enumerate(reel_urls, 1):
+            log(f"[{idx}/{len(reel_urls)}] scraping {url}")
             links = scrape_reels(page, url, seen, MAX_SCROLLS)
             all_links.extend(links)
             log(f"   found {len(links)} new reels (total {len(all_links)})")
