@@ -185,6 +185,26 @@ def to_mbasic(url):
     return urlunparse(parsed._replace(netloc="mbasic.facebook.com", scheme="https"))
 
 
+def looks_like_login_wall(html):
+    if not html:
+        return True
+    lowered = html.lower()
+    signals = [
+        "log into facebook", "log in to facebook", "you must log in",
+        "id=\"login_form\"", "name=\"login\"", "checkpoint",
+        "session has expired", "temporarily blocked",
+    ]
+    return any(s in lowered for s in signals)
+
+
+def save_debug_html(html, name):
+    os.makedirs("output", exist_ok=True)
+    path = os.path.join("output", name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html or "")
+    log(f"   saved debug html to {path}")
+
+
 def get_html(sess, url, attempts=MAX_RETRIES):
     last_err = None
     for attempt in range(1, attempts + 1):
@@ -202,23 +222,61 @@ def get_html(sess, url, attempts=MAX_RETRIES):
 
 
 # ---------------- listing (mbasic photos tab, paginated) ----------------
+def find_photo_hrefs(soup):
+    found = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/photo.php" in href or "/photo/" in href:
+            found.append(href)
+    return found
+
+
+def find_album_hrefs(soup):
+    found = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/media_set" in href or re.search(r'set=a\.', href):
+            found.append(href)
+    return found
+
+
 def collect_photo_links(sess, start_url, max_pages):
     url = to_mbasic(start_url)
     seen = set()
     links = []
+    checked_login_wall = False
 
-    for page_num in range(1, max_pages + 1):
-        log(f"   fetching listing page {page_num}/{max_pages}: {url}")
-        html = get_html(sess, url)
+    pages_to_visit = [url]
+    albums_to_visit = []
+    visited = set()
+    pages_done = 0
+
+    while pages_to_visit and pages_done < max_pages:
+        cur = pages_to_visit.pop(0)
+        if cur in visited:
+            continue
+        visited.add(cur)
+        pages_done += 1
+
+        log(f"   fetching listing page {pages_done}/{max_pages}: {cur}")
+        html = get_html(sess, cur)
+
+        if not checked_login_wall:
+            checked_login_wall = True
+            save_debug_html(html, "debug_listing_page1.html")
+            if looks_like_login_wall(html):
+                log("   !! this looks like a login wall / checkpoint page, not the photos tab.")
+                log("   !! your storage_state.json cookies are likely expired or incomplete "
+                     "(only a handful of cookies loaded -- need c_user, xs, fr, datr at minimum).")
+                log("   !! re-export storage_state.json from a fresh, fully logged-in Facebook "
+                     "session and re-run. see output/debug_listing_page1.html for what was returned.")
+
         if not html:
-            break
+            continue
         soup = BeautifulSoup(html, "html.parser")
 
         new_added = 0
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "/photo.php" not in href and "/photo/" not in href:
-                continue
+        for href in find_photo_hrefs(soup):
             abs_url = urljoin(MBASIC_BASE, href)
             qs = parse_qs(urlparse(abs_url).query)
             fbid = qs.get("fbid", [None])[0]
@@ -228,19 +286,28 @@ def collect_photo_links(sess, start_url, max_pages):
                 links.append((key, abs_url))
                 new_added += 1
 
-        log(f"   page {page_num}: +{new_added} photo(s), total {len(links)}")
+        # sk=photos on mbasic often shows albums, not a flat photo list -- queue them up
+        for href in find_album_hrefs(soup):
+            abs_url = urljoin(MBASIC_BASE, href)
+            if abs_url not in visited and abs_url not in albums_to_visit:
+                albums_to_visit.append(abs_url)
 
-        # find a "see more" / pagination link to continue
+        log(f"   page: +{new_added} photo(s), total {len(links)}, "
+            f"{len(albums_to_visit)} album(s) queued")
+
+        # pagination within the current page (see more / next)
         next_href = None
         for a in soup.find_all("a", href=True):
             text = a.get_text(strip=True)
             if re.search(r'see more|more photos|^next$', text, re.I):
                 next_href = a["href"]
                 break
-        if not next_href:
-            log("   no further pagination link found, stopping")
-            break
-        url = urljoin(MBASIC_BASE, next_href)
+        if next_href:
+            pages_to_visit.insert(0, urljoin(MBASIC_BASE, next_href))
+        elif albums_to_visit:
+            pages_to_visit.append(albums_to_visit.pop(0))
+        else:
+            log("   no further pagination or album link found, stopping")
 
     return links
 
