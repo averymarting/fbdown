@@ -168,12 +168,19 @@ def build_session(storage_state_path):
         with open(storage_state_path) as f:
             state = json.load(f)
         count = 0
+        names = []
         for c in state.get("cookies", []):
             domain = c.get("domain", "")
             if "facebook.com" in domain or "fbcdn.net" in domain:
                 sess.cookies.set(c.get("name", ""), c.get("value", ""), domain=domain)
                 count += 1
-        log(f"loaded {count} facebook cookie(s) into session")
+                names.append(c.get("name", ""))
+        log(f"loaded {count} facebook cookie(s) into session: {', '.join(sorted(names))}")
+        for critical in ("c_user", "xs"):
+            if critical not in names:
+                log(f"   !! MISSING critical cookie '{critical}' -- session will very likely "
+                    f"be treated as logged out. storage_state.json needs to be re-exported "
+                    f"from a fresh, fully logged-in facebook.com session.")
     else:
         log("no storage_state.json found -- requests will be unauthenticated")
     return sess
