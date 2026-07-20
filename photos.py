@@ -266,10 +266,54 @@ async def looks_like_login_wall(page):
     return any(m in body_text for m in login_markers)
 
 
+# JS helper: walks an element's children and builds its text the way a
+# human would read it, but substitutes emoji <img alt="..."> elements
+# with their actual emoji character instead of skipping them (which is
+# what plain innerText does -- FB renders emoji as images, not text).
+_EMOJI_AWARE_TEXT_JS = """
+function emojiAwareText(el) {
+    let result = '';
+    for (const node of el.childNodes) {
+        if (node.nodeType === Node.TEXT_NODE) {
+            result += node.textContent;
+        } else if (node.nodeType === Node.ELEMENT_NODE) {
+            if (node.tagName === 'IMG' && node.alt) {
+                result += node.alt;
+            } else {
+                result += emojiAwareText(node);
+            }
+        }
+    }
+    return result;
+}
+"""
+
+
+def _looks_like_scrambled_timestamp(text):
+    """Detect FB's per-character-span obfuscation used on timestamps
+    (e.g. 'posted 3h ago' rendered as one <span> per letter, reassembled
+    visually via CSS positioning). innerText/emojiAwareText joins these
+    in raw DOM order with newlines between them, producing garbage like
+    't\\nd\\nn\\no\\nr\\no\\nS...'. Heuristic: mostly single-character
+    lines when split on newline.
+    """
+    lines = [l for l in text.split('\n') if l.strip() != '']
+    if len(lines) < 6:
+        return False
+    single_char_lines = sum(1 for l in lines if len(l.strip()) <= 1)
+    return (single_char_lines / len(lines)) > 0.6
+
+
 def _clean_caption_text(t):
+    # collapse the newline-per-character artifacts from emojiAwareText
+    # (real captions may still have legit single '\n' line breaks, so
+    # we only fully reject via _looks_like_scrambled_timestamp below;
+    # here we just normalize whitespace for the other checks)
     raw = t.strip()
     low = raw.lower()
 
+    if _looks_like_scrambled_timestamp(raw):
+        return None
     if low in CAPTION_BLOCKLIST:
         return None
     if re.match(r'^\d+[hdwm]$', low):
@@ -283,7 +327,12 @@ def _clean_caption_text(t):
     if len(raw.split()) <= 3 and raw.istitle() and len(raw) < 25:
         return None
 
-    return raw
+    # normalize: collapse runs of whitespace/newlines from mixed
+    # text+emoji nodes into single spaces for a clean final caption
+    normalized = re.sub(r'\s+', ' ', raw).strip()
+    if len(normalized) < 3:
+        return None
+    return normalized
 
 
 async def extract_caption(page):
@@ -308,7 +357,9 @@ async def extract_caption(page):
         try:
             texts = await page.eval_on_selector_all(
                 sel,
-                "els => els.map(e => e.innerText.trim()).filter(t => t.length > 0)"
+                _EMOJI_AWARE_TEXT_JS + """
+                (els) => els.map(e => emojiAwareText(e).trim()).filter(t => t.length > 0)
+                """
             )
         except Exception:
             texts = []
@@ -320,7 +371,9 @@ async def extract_caption(page):
     try:
         texts = await page.eval_on_selector_all(
             "div[dir='auto'], span[dir='auto']",
-            "els => els.map(e => e.innerText.trim()).filter(t => t.length > 0)"
+            _EMOJI_AWARE_TEXT_JS + """
+            (els) => els.map(e => emojiAwareText(e).trim()).filter(t => t.length > 0)
+            """
         )
     except Exception:
         texts = []
