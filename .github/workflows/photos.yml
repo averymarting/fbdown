@@ -48,9 +48,7 @@ jobs:
       - name: Install Python deps
         run: |
           pip install --upgrade pip
-          pip install requests beautifulsoup4 google-api-python-client google-auth google-auth-httplib2 playwright
-      - name: Install Playwright browser (Chromium)
-        run: playwright install --with-deps chromium
+          pip install requests beautifulsoup4 google-api-python-client google-auth google-auth-httplib2
       - name: Install rclone
         run: |
           curl https://rclone.org/install.sh | sudo bash
