@@ -130,7 +130,16 @@ def append_rows(service, sheet_id, tab_name, rows):
 
 # ---------------- scraping (Playwright) ----------------
 def collect_photo_links(page, url, max_scrolls):
-    """Scroll the profile photos grid and collect unique photo permalink URLs."""
+    """Scroll the profile photos grid and collect unique photo permalink URLs.
+
+    IMPORTANT: we deliberately keep the FULL href, including any
+    &set=...&type=3 suffix. Testing showed that photo.php URLs with
+    &set=...&type=3 reliably render the post caption, while the bare
+    ?fbid=... form often renders a stripped lazy layout where the
+    caption span never mounts. Stripping the &set= part (as the
+    previous version did) was the main cause of missing/garbage
+    captions.
+    """
     page.goto(url, timeout=60000)
     page.wait_for_timeout(6000)
 
@@ -168,7 +177,8 @@ def collect_photo_links(page, url, max_scrolls):
             fbid = m.group(1)
             if fbid not in seen:
                 seen.add(fbid)
-                links.append((fbid, href.split('&set=')[0]))
+                # keep the full href (with &set=...&type=3 if present)
+                links.append((fbid, href))
                 new_added += 1
 
         cur_height = page.evaluate("document.body.scrollHeight")
@@ -222,11 +232,87 @@ def looks_like_login_wall(page):
     return any(m in body_text for m in login_markers)
 
 
+def _clean_caption_text(t):
+    """Shared filter used by extract_caption. Returns cleaned text or
+    None if this fragment should be rejected (chrome, link preview,
+    emoji-only, mention-only, page/profile name label, etc.)."""
+    raw = t.strip()
+    low = raw.lower()
+
+    if low in CAPTION_BLOCKLIST:
+        return None
+    if re.match(r'^\d+[hdwm]$', low):                 # "3h", "2d" timestamps
+        return None
+    if re.match(r'^[\d,]+$', low):                     # bare reaction counts
+        return None
+    if len(raw) < 3:
+        return None
+
+    # reject pure link-preview text, e.g. "https://t.co/Z05KVF8YzC"
+    if re.match(r'^https?://\S+$', raw):
+        return None
+
+    # reject page/profile name labels -- these are short (<=3 words,
+    # <25 chars), title-cased, and reappear verbatim across every photo
+    # on the same profile. This is what was producing the "Coco system"
+    # bug: the page/account display name was being picked up as if it
+    # were the caption.
+    if len(raw.split()) <= 3 and raw.istitle() and len(raw) < 25:
+        return None
+
+    return raw
+
+
 def extract_caption(page):
-    """Best-effort caption extraction. FB's markup is obfuscated and changes
-    often, so this grabs the first substantial dir='auto' text block and
-    filters out obvious UI chrome. Tune the selector list below if captions
-    come back empty or wrong for your page's current layout."""
+    """Robust caption extraction with multiple fallback strategies.
+
+    Strategy order:
+      1. Wait briefly for known caption containers to mount -- they are
+         often lazy-rendered, which is why fbid-only URLs (no &set=...)
+         sometimes came back with the caption missing or replaced by
+         unrelated short UI text (e.g. the page name).
+      2. Try FB's known caption/message containers first
+         (data-ad-preview, data-ad-comet-preview, post_message testid,
+         and the specific span/div structure FB uses for post text).
+      3. Fallback: scan all dir='auto' blocks, filter out chrome/links/
+         page-name labels, and pick the LONGEST remaining candidate --
+         the first dir='auto' block on the page is very often a nav or
+         header element, not the caption.
+    """
+    # give the caption container a moment to mount
+    try:
+        page.wait_for_selector(
+            "[data-ad-preview], [data-ad-comet-preview], "
+            "div[data-testid='post_message'], "
+            "div.xyinxu5, div[dir='auto']",
+            timeout=8000,
+        )
+    except Exception:
+        pass
+    # extra settle time specifically helps the lazy fbid-only layout
+    page.wait_for_timeout(1500)
+
+    # ---- Strategy 1: known caption containers ----
+    priority_selectors = [
+        "[data-ad-preview='message']",
+        "[data-ad-comet-preview='message']",
+        "div[data-testid='post_message']",
+        "div.xyinxu5",
+    ]
+    for sel in priority_selectors:
+        try:
+            texts = page.eval_on_selector_all(
+                sel,
+                "els => els.map(e => e.innerText.trim()).filter(t => t.length > 0)"
+            )
+        except Exception:
+            texts = []
+        for t in texts:
+            cleaned = _clean_caption_text(t)
+            if cleaned:
+                return cleaned
+
+    # ---- Strategy 2: generic dir='auto' scan, pick the longest valid one ----
     try:
         texts = page.eval_on_selector_all(
             "div[dir='auto'], span[dir='auto']",
@@ -235,17 +321,15 @@ def extract_caption(page):
     except Exception:
         texts = []
 
+    candidates = []
     for t in texts:
-        low = t.lower().strip()
-        if low in CAPTION_BLOCKLIST:
-            continue
-        if re.match(r'^\d+[hdwm]$', low):          # "3h", "2d" timestamps
-            continue
-        if re.match(r'^[\d,]+$', low):              # bare reaction counts
-            continue
-        if len(t) < 3:
-            continue
-        return t
+        cleaned = _clean_caption_text(t)
+        if cleaned:
+            candidates.append(cleaned)
+
+    if candidates:
+        return max(candidates, key=len)
+
     return ""
 
 
@@ -374,7 +458,9 @@ def main():
             log(f"[{idx}/{len(photo_links)}] opening {url}")
             try:
                 page.goto(url, timeout=60000)
-                page.wait_for_timeout(3000)
+                # bumped from 3000 -- the lazy fbid-only layout needs more
+                # settle time before the caption span mounts
+                page.wait_for_timeout(5000)
             except Exception as e:
                 log(f"   failed to open photo page: {e}")
                 continue
