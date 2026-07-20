@@ -49,6 +49,8 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install requests beautifulsoup4 google-api-python-client google-auth google-auth-httplib2
+      - name: Install Playwright browser
+        run: playwright install --with-deps chromium
       - name: Install rclone
         run: |
           curl https://rclone.org/install.sh | sudo bash
