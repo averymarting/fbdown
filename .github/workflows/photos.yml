@@ -27,9 +27,14 @@ on:
         default: ""
         type: string
       max_scrolls:
-        description: "How many times to scroll the photos tab"
+        description: "How many listing pages of the photos tab to fetch"
         required: false
         default: "3"
+        type: string
+      concurrency:
+        description: "How many photos to process in parallel"
+        required: false
+        default: "6"
         type: string
 jobs:
   run:
@@ -43,9 +48,7 @@ jobs:
       - name: Install Python deps
         run: |
           pip install --upgrade pip
-          pip install playwright requests google-api-python-client google-auth google-auth-httplib2
-      - name: Install Playwright browser
-        run: playwright install --with-deps chromium
+          pip install requests beautifulsoup4 google-api-python-client google-auth google-auth-httplib2
       - name: Install rclone
         run: |
           curl https://rclone.org/install.sh | sudo bash
@@ -62,6 +65,7 @@ jobs:
           SHEET_TAB_NAME: ${{ inputs.sheet_tab_name }}
           GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
           MAX_SCROLLS: ${{ inputs.max_scrolls }}
+          CONCURRENCY: ${{ inputs.concurrency }}
           FOLDER_NAME: ${{ inputs.folder_name }}
           MEGA_FOLDER_NAME: ${{ inputs.mega_folder_name }}
           MEGA_REMOTE: mega
