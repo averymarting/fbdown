@@ -6,7 +6,9 @@ Headless pipeline for GitHub Actions:
      accurate captions (og:description) and is light/fast to parse, but plain
      `requests` traffic gets bounced by Facebook's bot check regardless of
      User-Agent, so a real browser engine is required to fetch it.
-  2. A small pool of parallel browser workers processes photos concurrently.
+  2. A small pool of async workers shares ONE browser process (each worker
+     just gets its own lightweight context/page) and processes photos
+     concurrently.
   3. Log filename + caption into a (new or existing) tab of a Google Sheet.
   4. Upload downloaded images to a Mega.nz folder via rclone.
 
@@ -21,6 +23,17 @@ This script never sees the Mega password.
 
 SECURITY NOTE: never hardcode or print the contents of GOOGLE_TOKEN_JSON,
 storage_state.json, or rclone.conf. They are read from disk/env only.
+
+RECOVERY MODE (replaces the old separate push_csv_to_sheet.py):
+  If a run's images/Mega upload succeeded but the Sheets append step failed
+  (e.g. transient SSL error), you don't need to re-scrape. Just run:
+
+      python photos.py --push-csv
+
+  which reads the CSV that was already saved to output/<FOLDER_NAME>.csv (or
+  the path in CSV_PATH) and appends it to the sheet, skipping scraping,
+  downloading, and the Mega upload entirely. Uses the same SHEET_ID /
+  SHEET_TAB_NAME / GOOGLE_TOKEN_JSON env vars as a normal run.
 """
 import os
 import re
@@ -28,15 +41,14 @@ import sys
 import csv
 import json
 import time
-import queue
+import asyncio
 import datetime
-import threading
 import subprocess
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qs
 
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 MBASIC_BASE = "https://mbasic.facebook.com"
@@ -44,6 +56,15 @@ MBASIC_BASE = "https://mbasic.facebook.com"
 GENERIC_DESCRIPTIONS = {
     "", "see posts, photos and more on facebook.",
 }
+
+# Facebook's own auto-generated alt-text for photos it can't/won't render on
+# mbasic (e.g. "May be an image of one or more people and text", "No photo
+# description available."). These show up as literal visible text on mbasic
+# and used to get scooped up (and even concatenated together) by the caption
+# fallback scan below -- explicitly exclude them.
+ALT_TEXT_RE = re.compile(
+    r'^(may be (a|an)\b.*|no photo description available\.?)$', re.I
+)
 
 NAV_TEXT_RE = re.compile(
     r'^(like|comment|share|full size|view full size|comments?|write a comment|'
@@ -67,7 +88,13 @@ STORAGE_STATE     = os.environ.get("STORAGE_STATE_FILE", "storage_state.json")
 OUTPUT_DIR        = os.path.join("output", FOLDER_NAME)
 MAX_RETRIES       = int(os.environ.get("MAX_RETRIES", "3"))
 RETRY_DELAYS      = [5, 15, 30]
-CONCURRENCY       = int(os.environ.get("CONCURRENCY", "4"))
+# One shared browser process now backs every worker (see worker() below), so
+# concurrency is no longer gated by how many Chromium processes you can
+# afford to spawn -- bumped the default up accordingly. Override via env.
+CONCURRENCY       = int(os.environ.get("CONCURRENCY", "8"))
+# Fixed settle time after each page load. Was 800ms on every single request;
+# mbasic is server-rendered so it rarely needs that long.
+POST_LOAD_WAIT_MS = int(os.environ.get("POST_LOAD_WAIT_MS", "300"))
 
 # Google Sheet destination
 SHEET_ID          = os.environ.get("SHEET_ID", "").strip()
@@ -78,12 +105,12 @@ SHEET_TAB_NAME    = os.environ.get("SHEET_TAB_NAME", "").strip()
 MEGA_REMOTE       = os.environ.get("MEGA_REMOTE", "mega").strip()
 MEGA_FOLDER_NAME  = os.environ.get("MEGA_FOLDER_NAME", "").strip() or FOLDER_NAME
 
-_log_lock = threading.Lock()
+# Recovery mode
+CSV_PATH          = os.environ.get("CSV_PATH", os.path.join("output", f"{FOLDER_NAME}.csv")).strip()
 
 
 def log(msg):
-    with _log_lock:
-        print(msg, flush=True)
+    print(msg, flush=True)
 
 
 def check_cookie_names(storage_state_path):
@@ -183,14 +210,37 @@ def append_rows(service, sheet_id, tab_name, rows, chunk_size=40):
     log(f"appended {total} row(s) to tab '{tab_name}'")
 
 
+# ---------------- recovery mode: push an already-saved CSV ----------------
+def push_csv_only(csv_path):
+    if not (SHEET_ID and SHEET_TAB_NAME and GOOGLE_TOKEN_JSON):
+        log("SHEET_ID, SHEET_TAB_NAME and GOOGLE_TOKEN_JSON are all required for --push-csv")
+        sys.exit(1)
+    if not os.path.exists(csv_path):
+        log(f"csv not found at {csv_path}")
+        sys.exit(1)
+
+    rows = []
+    with open(csv_path, newline="") as f:
+        reader = csv.reader(f)
+        next(reader, None)  # header
+        for r in reader:
+            if r:
+                rows.append(r)
+
+    log(f"loaded {len(rows)} row(s) from {csv_path}")
+
+    service = get_sheets_service(GOOGLE_TOKEN_JSON)
+    ensure_tab_and_get_id(service, SHEET_ID, SHEET_TAB_NAME)
+    append_rows(service, SHEET_ID, SHEET_TAB_NAME, rows)
+
+
 # ---------------- browser-driven fetch helpers ----------------
 def to_mbasic(url):
     parsed = urlparse(url)
     return urlunparse(parsed._replace(netloc="mbasic.facebook.com", scheme="https"))
 
 
-_wall_checked = threading.Event()
-_wall_lock = threading.Lock()
+_wall_checked = False
 
 
 def looks_like_wall(html):
@@ -201,31 +251,32 @@ def looks_like_wall(html):
 
 
 def save_debug_html_once(html, name):
-    with _wall_lock:
-        if _wall_checked.is_set():
-            return
-        _wall_checked.set()
-        os.makedirs("output", exist_ok=True)
-        path = os.path.join("output", name)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(html or "")
-        log(f"   saved debug html to {path}")
-        if looks_like_wall(html):
-            log("   !! response looks like a login wall / bot-check / unsupported-browser page.")
-            log("   !! see output/debug_listing_page1.html for what was actually returned.")
+    global _wall_checked
+    if _wall_checked:
+        return
+    _wall_checked = True
+    os.makedirs("output", exist_ok=True)
+    path = os.path.join("output", name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html or "")
+    log(f"   saved debug html to {path}")
+    if looks_like_wall(html):
+        log("   !! response looks like a login wall / bot-check / unsupported-browser page.")
+        log("   !! see output/debug_listing_page1.html for what was actually returned.")
 
 
-def goto_html(page, url, attempts=MAX_RETRIES):
+async def goto_html(page, url, attempts=MAX_RETRIES):
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
-            page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            page.wait_for_timeout(800)
-            return page.content()
+            await page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            if POST_LOAD_WAIT_MS:
+                await page.wait_for_timeout(POST_LOAD_WAIT_MS)
+            return await page.content()
         except Exception as e:
             last_err = e
         if attempt < attempts:
-            time.sleep(RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)])
+            await asyncio.sleep(RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)])
     log(f"   failed to load {url}: {last_err}")
     return None
 
@@ -241,7 +292,7 @@ def find_album_hrefs(soup):
             if "/media_set" in a["href"] or re.search(r'set=a\.', a["href"])]
 
 
-def collect_photo_links(page, start_url, max_pages):
+async def collect_photo_links(page, start_url, max_pages):
     url = to_mbasic(start_url)
     seen = set()
     links = []
@@ -259,7 +310,7 @@ def collect_photo_links(page, start_url, max_pages):
         pages_done += 1
 
         log(f"   fetching listing page {pages_done}/{max_pages}: {cur}")
-        html = goto_html(page, cur)
+        html = await goto_html(page, cur)
 
         if first_page:
             first_page = False
@@ -305,8 +356,44 @@ def collect_photo_links(page, start_url, max_pages):
 
 
 # ---------------- photo detail (caption + image URL) ----------------
-def extract_photo_details(page, permalink_url):
-    html = goto_html(page, permalink_url)
+def extract_caption(soup):
+    """Pull the real photo caption, not Facebook's auto alt-text.
+
+    og:description is the most reliable source when present. When it's
+    missing/generic, fall back to scanning the page -- but only over LEAF
+    text nodes (tags with no nested div/span/p), because scanning parent
+    containers lets their text (which is the concatenation of every child's
+    text, including unrelated thumbnail alt-text elsewhere on the page)
+    masquerade as one giant "candidate" that wins on raw length.
+    """
+    og_desc = soup.find("meta", property="og:description")
+    if og_desc and og_desc.get("content"):
+        text = og_desc["content"].strip()
+        if text.lower() not in GENERIC_DESCRIPTIONS and not ALT_TEXT_RE.match(text):
+            return text
+
+    candidates = []
+    for tag in soup.find_all(["div", "span", "p"]):
+        if tag.find(["div", "span", "p"]):
+            continue  # not a leaf -- skip to avoid swallowing sibling/child junk
+        text = tag.get_text(" ", strip=True)
+        if not text or len(text) < 3:
+            continue
+        if NAV_TEXT_RE.match(text) or ALT_TEXT_RE.match(text):
+            continue
+        if text.lower() in GENERIC_DESCRIPTIONS:
+            continue
+        if re.match(r'^\d+\s*(min|hr|hrs|day|days|week|weeks)s?\s*(ago)?$', text, re.I):
+            continue
+        candidates.append(text)
+
+    if candidates:
+        return max(candidates, key=len)
+    return ""
+
+
+async def extract_photo_details(page, permalink_url):
+    html = await goto_html(page, permalink_url)
     if not html:
         return None, ""
     soup = BeautifulSoup(html, "html.parser")
@@ -325,25 +412,7 @@ def extract_photo_details(page, permalink_url):
         if img_tag:
             image_url = urljoin(MBASIC_BASE, img_tag["src"])
 
-    caption = ""
-    og_desc = soup.find("meta", property="og:description")
-    if og_desc and og_desc.get("content"):
-        text = og_desc["content"].strip()
-        if text.lower() not in GENERIC_DESCRIPTIONS:
-            caption = text
-
-    if not caption:
-        candidates = []
-        for tag in soup.find_all(["div", "span", "p"]):
-            text = tag.get_text(" ", strip=True)
-            if not text or len(text) < 3 or NAV_TEXT_RE.match(text):
-                continue
-            if re.match(r'^\d+\s*(min|hr|hrs|day|days|week|weeks)s?\s*(ago)?$', text, re.I):
-                continue
-            candidates.append(text)
-        if candidates:
-            caption = max(candidates, key=len)
-
+    caption = extract_caption(soup)
     return image_url, caption
 
 
@@ -352,25 +421,26 @@ def ext_from_url(image_url, default=".jpg"):
     return f".{m.group(1)}" if m else default
 
 
-def download_image(page, image_url, dest_path):
+async def download_image(page, image_url, dest_path):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = page.context.request.get(image_url, timeout=30000)
+            resp = await page.context.request.get(image_url, timeout=30000)
             if resp.ok:
+                body = await resp.body()
                 with open(dest_path, "wb") as f:
-                    f.write(resp.body())
+                    f.write(body)
                 return True
             log(f"   http {resp.status} for {image_url}")
         except Exception as e:
             log(f"   download error: {e}")
         if attempt < MAX_RETRIES:
-            time.sleep(RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)])
+            await asyncio.sleep(RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)])
     return False
 
 
-def process_one(page, fbid, permalink):
+async def process_one(page, fbid, permalink):
     try:
-        image_url, caption = extract_photo_details(page, permalink)
+        image_url, caption = await extract_photo_details(page, permalink)
     except Exception as e:
         log(f"   [{fbid}] scrape error: {e}")
         return None
@@ -382,7 +452,7 @@ def process_one(page, fbid, permalink):
     filename = f"{fbid}{ext}"
     dest_path = os.path.join(OUTPUT_DIR, filename)
 
-    if not download_image(page, image_url, dest_path):
+    if not await download_image(page, image_url, dest_path):
         log(f"   [{fbid}] gave up downloading")
         return None
 
@@ -390,27 +460,57 @@ def process_one(page, fbid, permalink):
     return [filename, caption, permalink]
 
 
-# ---------------- worker pool (each thread owns its own browser) ----------------
-def worker(worker_id, tasks, results, results_lock, storage_state_path):
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-notifications"])
-        state_arg = storage_state_path if os.path.exists(storage_state_path) else None
-        context = browser.new_context(storage_state=state_arg, viewport={"width": 1000, "height": 900})
-        page = context.new_page()
+# ---------------- worker pool: ONE shared browser, many lightweight pages ----------------
+async def worker(worker_id, browser, storage_state_path, task_queue, results):
+    state_arg = storage_state_path if os.path.exists(storage_state_path) else None
+    context = await browser.new_context(storage_state=state_arg, viewport={"width": 1000, "height": 900})
+    page = await context.new_page()
 
-        while True:
-            try:
-                fbid, permalink = tasks.get_nowait()
-            except queue.Empty:
-                break
-            row = process_one(page, fbid, permalink)
-            if row:
-                with results_lock:
-                    results.append(row)
-            tasks.task_done()
+    while True:
+        try:
+            fbid, permalink = task_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        row = await process_one(page, fbid, permalink)
+        if row:
+            results.append(row)
 
-        context.close()
-        browser.close()
+    await context.close()
+
+
+async def run_scrape():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--disable-notifications"])
+
+        # listing pass: one page off the shared browser
+        log(f"scraping {PAGE_PHOTOS_URL} via mbasic")
+        state_arg = STORAGE_STATE if os.path.exists(STORAGE_STATE) else None
+        listing_context = await browser.new_context(storage_state=state_arg, viewport={"width": 1000, "height": 900})
+        listing_page = await listing_context.new_page()
+        photo_links = await collect_photo_links(listing_page, PAGE_PHOTOS_URL, MAX_PAGES)
+        await listing_context.close()
+
+        log(f"found {len(photo_links)} photo permalink(s)")
+        if not photo_links:
+            await browser.close()
+            return []
+
+        # detail + download pass: shared browser, N lightweight contexts
+        task_queue = asyncio.Queue()
+        for fbid, permalink in photo_links:
+            task_queue.put_nowait((fbid, permalink))
+
+        results = []
+        workers = [
+            asyncio.create_task(worker(i, browser, STORAGE_STATE, task_queue, results))
+            for i in range(min(CONCURRENCY, len(photo_links)))
+        ]
+        await asyncio.gather(*workers)
+
+        await browser.close()
+        return results
 
 
 # ---------------- upload (Mega.nz via rclone) ----------------
@@ -447,6 +547,10 @@ def upload_all_mega():
 
 # ---------------- main ----------------
 def main():
+    if "--push-csv" in sys.argv:
+        push_csv_only(CSV_PATH)
+        return
+
     if not PAGE_PHOTOS_URL:
         log("PAGE_PHOTOS_URL is required, exiting")
         sys.exit(1)
@@ -467,39 +571,7 @@ def main():
     else:
         log("SHEET_ID / GOOGLE_TOKEN_JSON not both set, skipping sheet logging")
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    # listing pass: single browser in the main thread
-    log(f"scraping {PAGE_PHOTOS_URL} via mbasic")
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-notifications"])
-        state_arg = STORAGE_STATE if os.path.exists(STORAGE_STATE) else None
-        context = browser.new_context(storage_state=state_arg, viewport={"width": 1000, "height": 900})
-        page = context.new_page()
-        photo_links = collect_photo_links(page, PAGE_PHOTOS_URL, MAX_PAGES)
-        context.close()
-        browser.close()
-
-    log(f"found {len(photo_links)} photo permalink(s)")
-    if not photo_links:
-        log("no photos found, exiting")
-        return
-
-    # detail + download pass: pool of workers, each with its own browser
-    tasks = queue.Queue()
-    for fbid, permalink in photo_links:
-        tasks.put((fbid, permalink))
-
-    results = []
-    results_lock = threading.Lock()
-    threads = [
-        threading.Thread(target=worker, args=(i, tasks, results, results_lock, STORAGE_STATE))
-        for i in range(min(CONCURRENCY, len(photo_links)))
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    results = asyncio.run(run_scrape())
 
     if results:
         csv_path = os.path.join("output", f"{FOLDER_NAME}.csv")
