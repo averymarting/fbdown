@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Headless pipeline for GitHub Actions (no GUI):
-  1. Scrape a Facebook Page's Photos tab with Playwright (headless Chromium)
-     -> collect each photo's image URL + its caption text
-  2. Download every photo (requests, using the Playwright session's cookies)
+Headless pipeline for GitHub Actions (no GUI, no headless browser):
+  1. Scrape a Facebook Page's Photos tab via mbasic.facebook.com (server-rendered
+     plain HTML -- fast, and og:description on this version actually contains
+     the real post caption instead of the client-rendered auto-alt-text)
+  2. Download every photo (parallelized with a thread pool)
   3. Log filename + caption into a (new or existing) tab of a Google Sheet
   4. Upload downloaded images to a Mega.nz folder via rclone
 
 Credential files, written by the workflow from GitHub Secrets:
   - storage_state.json        -> Facebook Playwright storage_state (cookies + origins)
+                                  (still used here just as a cookie source for requests)
   - GOOGLE_TOKEN_JSON env var -> Google OAuth token (installed-app style: token,
     refresh_token, token_uri, client_id, client_secret, scopes)
     NOTE: writing a new tab + rows requires the FULL
@@ -17,8 +19,6 @@ Credential files, written by the workflow from GitHub Secrets:
 Mega.nz credentials are handled entirely by rclone's own config file
 (~/.config/rclone/rclone.conf), which the workflow writes from the
 RCLONE_CONF GitHub Secret. This script never sees the Mega password.
-
-All run parameters come from environment variables set by the workflow_dispatch inputs.
 
 SECURITY NOTE: never hardcode or print the contents of GOOGLE_TOKEN_JSON,
 storage_state.json, or rclone.conf. They are read from disk/env only.
@@ -32,44 +32,51 @@ import time
 import datetime
 import subprocess
 from pathlib import Path
+from urllib.parse import urljoin, urlparse, urlunparse, parse_qs
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
+MBASIC_BASE = "https://mbasic.facebook.com"
+
+GENERIC_DESCRIPTIONS = {
+    "", "see posts, photos and more on facebook.",
+}
+
+NAV_TEXT_RE = re.compile(
+    r'^(like|comment|share|full size|view full size|comments?|write a comment|'
+    r'see more|see less|reply|\d+[\d,.]*\s*(likes?|comments?|shares?)|'
+    r'photo|options|report)$', re.I
+)
 
 # ---- config from environment / workflow inputs ----
 PAGE_PHOTOS_URL   = os.environ.get("PAGE_PHOTOS_URL", "").strip()
-MAX_SCROLLS        = int(os.environ.get("MAX_SCROLLS", "3"))
-FOLDER_NAME        = os.environ.get("FOLDER_NAME", "facebook_photos")
-STORAGE_STATE      = os.environ.get("STORAGE_STATE_FILE", "storage_state.json")
-OUTPUT_DIR         = os.path.join("output", FOLDER_NAME)
-MAX_RETRIES        = int(os.environ.get("MAX_RETRIES", "3"))
-RETRY_DELAYS       = [10, 30, 60]
-MAX_CONSEC_FAIL    = 5
-COOLDOWN_SLEEP     = 90
-PER_PHOTO_SLEEP    = int(os.environ.get("PER_PHOTO_SLEEP", "2"))
+MAX_PAGES         = int(os.environ.get("MAX_SCROLLS", os.environ.get("MAX_PAGES", "3")))
+FOLDER_NAME       = os.environ.get("FOLDER_NAME", "facebook_photos")
+STORAGE_STATE     = os.environ.get("STORAGE_STATE_FILE", "storage_state.json")
+OUTPUT_DIR        = os.path.join("output", FOLDER_NAME)
+MAX_RETRIES       = int(os.environ.get("MAX_RETRIES", "3"))
+RETRY_DELAYS      = [5, 15, 30]
+CONCURRENCY       = int(os.environ.get("CONCURRENCY", "6"))
 
 # Google Sheet destination
-SHEET_ID           = os.environ.get("SHEET_ID", "").strip()
-GOOGLE_TOKEN_JSON  = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
-SHEET_TAB_NAME     = os.environ.get("SHEET_TAB_NAME", "").strip()
+SHEET_ID          = os.environ.get("SHEET_ID", "").strip()
+GOOGLE_TOKEN_JSON = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
+SHEET_TAB_NAME    = os.environ.get("SHEET_TAB_NAME", "").strip()
 
 # Mega / rclone config
-MEGA_REMOTE        = os.environ.get("MEGA_REMOTE", "mega").strip()
-MEGA_FOLDER_NAME   = os.environ.get("MEGA_FOLDER_NAME", "").strip() or FOLDER_NAME
+MEGA_REMOTE       = os.environ.get("MEGA_REMOTE", "mega").strip()
+MEGA_FOLDER_NAME  = os.environ.get("MEGA_FOLDER_NAME", "").strip() or FOLDER_NAME
 
 
 def log(msg):
     print(msg, flush=True)
 
 
-# ---------------- Google Sheets (write) ----------------
+# ---------------- Google Sheets (write, retried/chunked) ----------------
 def with_retries(fn, *args, attempts=5, base_delay=5, **kwargs):
-    """Retries a Google API call on transient network/SSL errors with
-    exponential backoff. Rebuilds nothing itself -- caller's callable
-    should be idempotent-safe (Sheets appends are, since each retry just
-    re-sends the same batch)."""
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
@@ -79,8 +86,7 @@ def with_retries(fn, *args, attempts=5, base_delay=5, **kwargs):
             if attempt == attempts:
                 break
             delay = base_delay * (2 ** (attempt - 1))
-            log(f"   Sheets API call failed ({e}), retrying in {delay}s "
-                f"[{attempt}/{attempts}]")
+            log(f"   Sheets API call failed ({e}), retrying in {delay}s [{attempt}/{attempts}]")
             time.sleep(delay)
     raise last_err
 
@@ -105,7 +111,6 @@ def get_sheets_service(token_json_str):
 
 
 def ensure_tab_and_get_id(service, sheet_id, tab_name):
-    """Creates the tab if it doesn't exist yet. Returns the sheetId (int)."""
     meta = with_retries(service.spreadsheets().get(spreadsheetId=sheet_id).execute)
     for s in meta.get("sheets", []):
         if s["properties"]["title"] == tab_name:
@@ -120,7 +125,6 @@ def ensure_tab_and_get_id(service, sheet_id, tab_name):
     )
     new_sheet_id = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
 
-    # header row
     with_retries(
         service.spreadsheets().values().update(
             spreadsheetId=sheet_id,
@@ -133,9 +137,6 @@ def ensure_tab_and_get_id(service, sheet_id, tab_name):
 
 
 def append_rows(service, sheet_id, tab_name, rows, chunk_size=40):
-    """rows: list of [filename, caption, source_url]. Sent in smaller chunks
-    so a single dropped connection doesn't lose the whole batch, and each
-    chunk is retried independently on transient failures."""
     if not rows:
         return
     total = 0
@@ -155,122 +156,145 @@ def append_rows(service, sheet_id, tab_name, rows, chunk_size=40):
     log(f"appended {total} row(s) to tab '{tab_name}'")
 
 
-# ---------------- scraping (Playwright) ----------------
-def collect_photo_links(page, url, max_scrolls):
-    page.goto(url, timeout=60000)
-    page.wait_for_timeout(8000)
+# ---------------- HTTP session (cookies from storage_state) ----------------
+def build_session(storage_state_path):
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    if os.path.exists(storage_state_path):
+        with open(storage_state_path) as f:
+            state = json.load(f)
+        count = 0
+        for c in state.get("cookies", []):
+            domain = c.get("domain", "")
+            if "facebook.com" in domain or "fbcdn.net" in domain:
+                sess.cookies.set(c.get("name", ""), c.get("value", ""), domain=domain)
+                count += 1
+        log(f"loaded {count} facebook cookie(s) into session")
+    else:
+        log("no storage_state.json found -- requests will be unauthenticated")
+    return sess
 
-    try:
-        page.locator("div[aria-label='Close'], div[role='button']").first.click(timeout=3000)
-        page.wait_for_timeout(2000)
-    except Exception:
-        pass
 
+def to_mbasic(url):
+    """Rewrite a www./web./m. facebook.com URL to its mbasic.facebook.com equivalent."""
+    parsed = urlparse(url)
+    return urlunparse(parsed._replace(netloc="mbasic.facebook.com", scheme="https"))
+
+
+def get_html(sess, url, attempts=MAX_RETRIES):
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            r = sess.get(url, timeout=25)
+            if r.status_code == 200:
+                return r.text
+            last_err = f"http {r.status_code}"
+        except Exception as e:
+            last_err = str(e)
+        if attempt < attempts:
+            time.sleep(RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)])
+    log(f"   failed to fetch {url}: {last_err}")
+    return None
+
+
+# ---------------- listing (mbasic photos tab, paginated) ----------------
+def collect_photo_links(sess, start_url, max_pages):
+    url = to_mbasic(start_url)
     seen = set()
     links = []
-    scroll_num = 0
-    no_progress = 0
-    prev_count = 0
-    last_height = page.evaluate("document.body.scrollHeight")
 
-    log(f"   scrolling up to {max_scrolls} time(s)...")
-
-    while scroll_num < max_scrolls and no_progress < 5:
-        scroll_num += 1
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(3000)
-        for _ in range(6):
-            page.evaluate("window.scrollBy(0, 900)")
-            page.wait_for_timeout(700)
-        page.wait_for_timeout(3000)
-
-        cur_height = page.evaluate("document.body.scrollHeight")
-        hrefs = page.eval_on_selector_all("a[href*='/photo']", "els => els.map(e => e.href)")
+    for page_num in range(1, max_pages + 1):
+        log(f"   fetching listing page {page_num}/{max_pages}: {url}")
+        html = get_html(sess, url)
+        if not html:
+            break
+        soup = BeautifulSoup(html, "html.parser")
 
         new_added = 0
-        for href in hrefs:
-            if not href:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/photo.php" not in href and "/photo/" not in href:
                 continue
-            clean = re.sub(r'&?set=[^&]*', '', href)
-            clean = re.sub(r'&?type=[^&]*', '', clean)
-            fbid_match = re.search(r'fbid=(\d+)', clean)
-            key = fbid_match.group(1) if fbid_match else clean
+            abs_url = urljoin(MBASIC_BASE, href)
+            qs = parse_qs(urlparse(abs_url).query)
+            fbid = qs.get("fbid", [None])[0]
+            key = fbid or abs_url
             if key not in seen:
                 seen.add(key)
-                links.append((key, href))
+                links.append((key, abs_url))
                 new_added += 1
 
-        if len(links) == prev_count and cur_height == last_height:
-            no_progress += 1
-        else:
-            no_progress = 0
-        prev_count = len(links)
-        last_height = cur_height
+        log(f"   page {page_num}: +{new_added} photo(s), total {len(links)}")
 
-        log(f"   scroll {scroll_num}/{max_scrolls} -> {len(links)} photos (+{new_added})")
+        # find a "see more" / pagination link to continue
+        next_href = None
+        for a in soup.find_all("a", href=True):
+            text = a.get_text(strip=True)
+            if re.search(r'see more|more photos|^next$', text, re.I):
+                next_href = a["href"]
+                break
+        if not next_href:
+            log("   no further pagination link found, stopping")
+            break
+        url = urljoin(MBASIC_BASE, next_href)
 
     return links
 
 
-def extract_photo_details(page, fbid, permalink_url):
-    """Visit a single photo permalink and pull the full-res image URL + caption."""
-    page.goto(permalink_url, timeout=60000)
-    page.wait_for_timeout(3500)
+# ---------------- photo detail (caption + image URL) ----------------
+def extract_photo_details(sess, permalink_url):
+    html = get_html(sess, permalink_url)
+    if not html:
+        return None, ""
+    soup = BeautifulSoup(html, "html.parser")
 
-    # full-res image: og:image meta tag is the most reliable source
+    # --- image URL ---
     image_url = None
-    try:
-        image_url = page.eval_on_selector(
-            "meta[property='og:image']", "el => el.content"
-        )
-    except Exception:
-        pass
+    for a in soup.find_all("a", href=True):
+        if re.search(r'view full size|full size', a.get_text(strip=True), re.I):
+            candidate = urljoin(MBASIC_BASE, a["href"])
+            image_url = candidate
+            break
     if not image_url:
-        try:
-            image_url = page.eval_on_selector(
-                "img[data-visualcompletion='media-vc-image']", "el => el.src"
-            )
-        except Exception:
-            pass
+        og_image = soup.find("meta", property="og:image")
+        if og_image and og_image.get("content"):
+            image_url = og_image["content"]
+    if not image_url:
+        img_tag = soup.find("img", src=True)
+        if img_tag:
+            image_url = urljoin(MBASIC_BASE, img_tag["src"])
 
-    # caption: prefer the real og:description / meta description, fall back to
-    # the auto-alt text on the image, fall back to empty string
-    caption = None
-    try:
-        caption = page.eval_on_selector(
-            "meta[property='og:description']", "el => el.content"
-        )
-    except Exception:
-        pass
+    # --- caption ---
+    caption = ""
+    og_desc = soup.find("meta", property="og:description")
+    if og_desc and og_desc.get("content"):
+        text = og_desc["content"].strip()
+        if text.lower() not in GENERIC_DESCRIPTIONS:
+            caption = text
+
     if not caption:
-        try:
-            caption = page.eval_on_selector(
-                "img[data-visualcompletion='media-vc-image']", "el => el.alt"
-            )
-        except Exception:
-            pass
-    caption = (caption or "").strip()
+        # fall back: scan visible text blocks for the longest non-nav chunk
+        candidates = []
+        for tag in soup.find_all(["div", "span", "p"]):
+            text = tag.get_text(" ", strip=True)
+            if not text or len(text) < 3:
+                continue
+            if NAV_TEXT_RE.match(text):
+                continue
+            if re.match(r'^\d+\s*(min|hr|hrs|day|days|week|weeks)s?\s*(ago)?$', text, re.I):
+                continue
+            candidates.append(text)
+        if candidates:
+            caption = max(candidates, key=len)
 
     return image_url, caption
 
 
 # ---------------- download ----------------
-def build_requests_session(storage_state_path):
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    })
-    if os.path.exists(storage_state_path):
-        with open(storage_state_path) as f:
-            state = json.load(f)
-        for c in state.get("cookies", []):
-            domain = c.get("domain", "")
-            if "facebook.com" in domain or "fbcdn.net" in domain:
-                sess.cookies.set(c.get("name", ""), c.get("value", ""), domain=domain)
-    return sess
-
-
 def download_image(sess, image_url, dest_path):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -283,14 +307,35 @@ def download_image(sess, image_url, dest_path):
         except Exception as e:
             log(f"   download error: {e}")
         if attempt < MAX_RETRIES:
-            delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
-            time.sleep(delay)
+            time.sleep(RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)])
     return False
 
 
 def ext_from_url(image_url, default=".jpg"):
     m = re.search(r'\.(jpg|jpeg|png|webp)(\?|$)', image_url.lower())
     return f".{m.group(1)}" if m else default
+
+
+def process_one(sess, fbid, permalink):
+    try:
+        image_url, caption = extract_photo_details(sess, permalink)
+    except Exception as e:
+        log(f"   [{fbid}] scrape error: {e}")
+        return None
+    if not image_url:
+        log(f"   [{fbid}] no image URL found, skipping")
+        return None
+
+    ext = ext_from_url(image_url)
+    filename = f"{fbid}{ext}"
+    dest_path = os.path.join(OUTPUT_DIR, filename)
+
+    if not download_image(sess, image_url, dest_path):
+        log(f"   [{fbid}] gave up downloading")
+        return None
+
+    log(f"   [{fbid}] ok -> {filename}")
+    return [filename, caption, permalink]
 
 
 # ---------------- upload (Mega.nz via rclone) ----------------
@@ -349,76 +394,46 @@ def main():
         log("SHEET_ID / GOOGLE_TOKEN_JSON not both set, skipping sheet logging")
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    sess = build_requests_session(STORAGE_STATE)
+    sess = build_session(STORAGE_STATE)
 
-    sheet_rows = []
-    csv_rows = []
-    consec_fail = 0
+    log(f"scraping {PAGE_PHOTOS_URL} via mbasic")
+    photo_links = collect_photo_links(sess, PAGE_PHOTOS_URL, MAX_PAGES)
+    log(f"found {len(photo_links)} photo permalink(s)")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-notifications"])
-        state_arg = STORAGE_STATE if os.path.exists(STORAGE_STATE) else None
-        context = browser.new_context(storage_state=state_arg, viewport={"width": 1400, "height": 1000})
-        page = context.new_page()
+    if not photo_links:
+        log("no photos found, exiting")
+        return
 
-        log(f"scraping {PAGE_PHOTOS_URL}")
-        photo_links = collect_photo_links(page, PAGE_PHOTOS_URL, MAX_SCROLLS)
-        log(f"found {len(photo_links)} photo permalink(s)")
+    rows = []
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        futures = {
+            pool.submit(process_one, sess, fbid, permalink): fbid
+            for fbid, permalink in photo_links
+        }
+        done = 0
+        for future in as_completed(futures):
+            done += 1
+            result = future.result()
+            if result:
+                rows.append(result)
+            if done % 10 == 0 or done == len(futures):
+                log(f"progress: {done}/{len(futures)} processed, {len(rows)} succeeded")
 
-        for i, (fbid, permalink) in enumerate(photo_links, 1):
-            if consec_fail >= MAX_CONSEC_FAIL:
-                log(f"cooling down after {consec_fail} consecutive failures...")
-                time.sleep(COOLDOWN_SLEEP)
-                consec_fail = 0
-
-            log(f"[{i}/{len(photo_links)}] {permalink}")
-            try:
-                image_url, caption = extract_photo_details(page, fbid, permalink)
-            except Exception as e:
-                log(f"   scrape error: {e}")
-                consec_fail += 1
-                continue
-
-            if not image_url:
-                log("   no image URL found, skipping")
-                consec_fail += 1
-                continue
-
-            ext = ext_from_url(image_url)
-            filename = f"{fbid}{ext}"
-            dest_path = os.path.join(OUTPUT_DIR, filename)
-
-            if download_image(sess, image_url, dest_path):
-                consec_fail = 0
-                sheet_rows.append([filename, caption, permalink])
-                csv_rows.append([filename, caption, permalink])
-            else:
-                consec_fail += 1
-                log(f"   gave up on {permalink}")
-
-            time.sleep(PER_PHOTO_SLEEP)
-
-        if state_arg:
-            context.storage_state(path=STORAGE_STATE)
-        context.close()
-        browser.close()
-
-    # local csv backup regardless of sheet outcome
-    if csv_rows:
+    if rows:
         csv_path = os.path.join("output", f"{FOLDER_NAME}.csv")
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["filename", "caption", "source_url"])
-            w.writerows(csv_rows)
-        log(f"local csv saved: {csv_path} ({len(csv_rows)} rows)")
+            w.writerows(rows)
+        log(f"local csv saved: {csv_path} ({len(rows)} rows)")
 
-    if sheets_service and sheet_rows:
+    if sheets_service and rows:
         try:
-            append_rows(sheets_service, SHEET_ID, tab_name, sheet_rows)
+            append_rows(sheets_service, SHEET_ID, tab_name, rows)
         except Exception as e:
             log(f"failed to append rows to sheet: {e}")
 
-    if not csv_rows:
+    if not rows:
         log("nothing downloaded, skipping Mega upload")
         return
 
