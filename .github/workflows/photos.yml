@@ -1,0 +1,80 @@
+name: Facebook Photos -> Sheet + Mega.nz
+on:
+  workflow_dispatch:
+    inputs:
+      page_photos_url:
+        description: "Facebook Page photos URL (e.g. https://web.facebook.com/profile.php?id=...&sk=photos)"
+        required: true
+        type: string
+      sheet_id:
+        description: "Google Sheet ID to log filename+caption into"
+        required: false
+        default: "1pbH8zo8kAV2Gy_N5kfeuTWAKHrqAqXXu76o5XvkxiMQ"
+        type: string
+      sheet_tab_name:
+        description: "Tab name to create/use for this run's results (leave blank for an auto timestamp name)"
+        required: false
+        default: ""
+        type: string
+      folder_name:
+        description: "Local output folder name for this run"
+        required: false
+        default: "facebook_photos"
+        type: string
+      mega_folder_name:
+        description: "Destination folder name on Mega.nz (defaults to folder_name if left blank)"
+        required: false
+        default: ""
+        type: string
+      max_scrolls:
+        description: "How many times to scroll the photos tab"
+        required: false
+        default: "3"
+        type: string
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python deps
+        run: |
+          pip install --upgrade pip
+          pip install playwright requests google-api-python-client google-auth google-auth-httplib2
+      - name: Install Playwright browser
+        run: playwright install --with-deps chromium
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+      - name: Write secrets to disk
+        run: |
+          echo '${{ secrets.FB_STORAGE_STATE }}' > storage_state.json
+          mkdir -p "$HOME/.config/rclone"
+          printf '%s\n' "${{ secrets.RCLONE_CONF }}" > "$HOME/.config/rclone/rclone.conf"
+          chmod 600 "$HOME/.config/rclone/rclone.conf"
+      - name: Run pipeline
+        env:
+          PAGE_PHOTOS_URL: ${{ inputs.page_photos_url }}
+          SHEET_ID: ${{ inputs.sheet_id }}
+          SHEET_TAB_NAME: ${{ inputs.sheet_tab_name }}
+          GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
+          MAX_SCROLLS: ${{ inputs.max_scrolls }}
+          FOLDER_NAME: ${{ inputs.folder_name }}
+          MEGA_FOLDER_NAME: ${{ inputs.mega_folder_name }}
+          MEGA_REMOTE: mega
+          STORAGE_STATE_FILE: storage_state.json
+        run: python photos.py
+      - name: Upload run CSV as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-output-${{ github.run_id }}
+          path: |
+            output/*.csv
+          retention-days: 7
+      - name: Clean up secret files
+        if: always()
+        run: rm -f storage_state.json "$HOME/.config/rclone/rclone.conf"
