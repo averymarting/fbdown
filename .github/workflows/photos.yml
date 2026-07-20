@@ -1,25 +1,21 @@
-name: Facebook Photos -> Sheet + Mega.nz
+name: Facebook Reels -> Mega.nz
 on:
   workflow_dispatch:
     inputs:
-      page_photos_url:
-        description: "Facebook Page photos URL (e.g. https://web.facebook.com/profile.php?id=...&sk=photos)"
-        required: true
-        type: string
       sheet_id:
-        description: "Google Sheet ID to log filename+caption into"
+        description: "Google Sheet ID holding the URL tabs (every tab in the sheet is read)"
         required: false
         default: "1pbH8zo8kAV2Gy_N5kfeuTWAKHrqAqXXu76o5XvkxiMQ"
         type: string
-      sheet_tab_name:
-        description: "Tab name to create/use for this run's results (leave blank for an auto timestamp name)"
+      reel_urls:
+        description: "Fallback: Facebook Reels tab URL(s), one per line (used only if sheet_id is blank or unreadable)"
         required: false
         default: ""
         type: string
       folder_name:
         description: "Local output folder name for this run"
         required: false
-        default: "facebook_photos"
+        default: "facebook_reels"
         type: string
       mega_folder_name:
         description: "Destination folder name on Mega.nz (defaults to folder_name if left blank)"
@@ -27,14 +23,9 @@ on:
         default: ""
         type: string
       max_scrolls:
-        description: "How many listing pages of the photos tab to fetch"
+        description: "How many times to scroll each reels tab"
         required: false
-        default: "3"
-        type: string
-      concurrency:
-        description: "How many photos to process in parallel"
-        required: false
-        default: "6"
+        default: "2"
         type: string
 jobs:
   run:
@@ -48,7 +39,7 @@ jobs:
       - name: Install Python deps
         run: |
           pip install --upgrade pip
-          pip install requests beautifulsoup4 google-api-python-client google-auth google-auth-httplib2 playwright
+          pip install playwright yt-dlp google-api-python-client google-auth google-auth-httplib2
       - name: Install Playwright browser
         run: playwright install --with-deps chromium
       - name: Install rclone
@@ -62,26 +53,23 @@ jobs:
           chmod 600 "$HOME/.config/rclone/rclone.conf"
       - name: Run pipeline
         env:
-          PAGE_PHOTOS_URL: ${{ inputs.page_photos_url }}
           SHEET_ID: ${{ inputs.sheet_id }}
-          SHEET_TAB_NAME: ${{ inputs.sheet_tab_name }}
           GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
+          REEL_URLS: ${{ inputs.reel_urls }}
           MAX_SCROLLS: ${{ inputs.max_scrolls }}
-          CONCURRENCY: ${{ inputs.concurrency }}
           FOLDER_NAME: ${{ inputs.folder_name }}
           MEGA_FOLDER_NAME: ${{ inputs.mega_folder_name }}
           MEGA_REMOTE: mega
           STORAGE_STATE_FILE: storage_state.json
-        run: python photos.py
-      - name: Upload run CSV as artifact
+        run: python reels.py
+      - name: Upload run CSVs as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: run-output-${{ github.run_id }}
           path: |
             output/*.csv
-            output/*.html
           retention-days: 7
       - name: Clean up secret files
         if: always()
-        run: rm -f storage_state.json "$HOME/.config/rclone/rclone.conf"
+        run: rm -f storage_state.json fb_cookies.txt "$HOME/.config/rclone/rclone.conf"
