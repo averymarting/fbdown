@@ -78,6 +78,7 @@ jobs:
           name: run-output-${{ github.run_id }}
           path: |
             output/*.csv
+            output/*.html
           retention-days: 7
       - name: Clean up secret files
         if: always()
