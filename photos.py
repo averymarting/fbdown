@@ -160,8 +160,8 @@ def append_rows(service, sheet_id, tab_name, rows, chunk_size=40):
 def build_session(storage_state_path):
     sess = requests.Session()
     sess.headers.update({
-        "User-Agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept-Language": "en-US,en;q=0.9",
     })
     if os.path.exists(storage_state_path):
@@ -200,6 +200,8 @@ def looks_like_login_wall(html):
         "log into facebook", "log in to facebook", "you must log in",
         "id=\"login_form\"", "name=\"login\"", "checkpoint",
         "session has expired", "temporarily blocked",
+        "not available on this browser", "get the facebook lite app",
+        "unsupported-interstitial",
     ]
     return any(s in lowered for s in signals)
 
