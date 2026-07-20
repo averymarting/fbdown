@@ -56,6 +56,14 @@ GOOGLE_TOKEN_JSON  = os.environ.get("GOOGLE_TOKEN_JSON", "").strip()
 MEGA_REMOTE        = os.environ.get("MEGA_REMOTE", "mega").strip()
 MEGA_FOLDER_NAME   = os.environ.get("MEGA_FOLDER_NAME", "").strip() or FOLDER_NAME
 
+# Debugging: when true, saves a screenshot + full HTML dump for every photo
+# page visited (or just the failures if DEBUG_ONLY_FAILURES=true) into
+# output/debug/. Turn on when things silently fail so you can see exactly
+# what Playwright was looking at.
+DEBUG_MODE          = os.environ.get("DEBUG_MODE", "true").strip().lower() in ("1", "true", "yes")
+DEBUG_ONLY_FAILURES = os.environ.get("DEBUG_ONLY_FAILURES", "false").strip().lower() in ("1", "true", "yes")
+DEBUG_DIR           = os.path.join("output", "debug")
+
 # UI chrome text we never want to mistake for a caption
 CAPTION_BLOCKLIST = {
     "like", "comment", "share", "reply", "see more", "see translation",
@@ -141,7 +149,11 @@ def collect_photo_links(page, url, max_scrolls):
     log(f"   scrolling up to {max_scrolls} time(s) to collect photo links...")
     while scroll_num < max_scrolls and no_progress < 5:
         scroll_num += 1
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        # small incremental scrolls with pauses trigger FB's lazy-loading far
+        # more reliably than a single jump to the bottom
+        for _ in range(6):
+            page.evaluate("window.scrollBy(0, 900)")
+            page.wait_for_timeout(700)
         page.wait_for_timeout(2500)
 
         hrefs = page.eval_on_selector_all(
@@ -168,6 +180,46 @@ def collect_photo_links(page, url, max_scrolls):
         log(f"   scroll {scroll_num}/{max_scrolls} -> {len(links)} photo(s) (+{new_added})")
 
     return links
+
+
+def save_debug(page, fbid, tag=""):
+    """Dump a screenshot + full HTML of the current page state for inspection.
+    Also logs the resolved URL/title so login/checkpoint walls are obvious."""
+    if not DEBUG_MODE:
+        return
+    os.makedirs(DEBUG_DIR, exist_ok=True)
+    suffix = f"_{tag}" if tag else ""
+    png_path = os.path.join(DEBUG_DIR, f"{fbid}{suffix}.png")
+    html_path = os.path.join(DEBUG_DIR, f"{fbid}{suffix}.html")
+    try:
+        page.screenshot(path=png_path, full_page=True, timeout=15000)
+    except Exception as e:
+        log(f"   [debug] screenshot failed: {e}")
+    try:
+        html_path_obj = Path(html_path)
+        html_path_obj.write_text(page.content(), encoding="utf-8")
+    except Exception as e:
+        log(f"   [debug] html dump failed: {e}")
+    log(f"   [debug] resolved url: {page.url}")
+    try:
+        log(f"   [debug] page title: {page.title()}")
+    except Exception:
+        pass
+
+
+def looks_like_login_wall(page):
+    url = page.url.lower()
+    if "login" in url or "checkpoint" in url or "recover" in url:
+        return True
+    try:
+        body_text = page.eval_on_selector("body", "e => e.innerText").lower()
+    except Exception:
+        return False
+    login_markers = [
+        "log in to facebook", "you must log in", "log into facebook",
+        "you'll need to log in", "enter your password",
+    ]
+    return any(m in body_text for m in login_markers)
 
 
 def extract_caption(page):
@@ -198,13 +250,41 @@ def extract_caption(page):
 
 
 def extract_image_url(page):
-    """Pick the largest / highest-res <img> on the photo page (the actual
-    photo, not thumbnails or profile pictures)."""
+    """Pick the full-res photo <img> on the photo page (not thumbnails or
+    profile pictures). Tries FB's own "this is the main photo" marker first,
+    then falls back to the largest loaded image on the page. Actively waits
+    for images to finish loading first, since naturalWidth is 0 until then."""
+
+    # give lazy-loaded images a chance to actually finish loading
+    try:
+        page.wait_for_function(
+            """() => {
+                const imgs = Array.from(document.querySelectorAll('img'));
+                return imgs.some(e => e.naturalWidth > 400 && e.complete);
+            }""",
+            timeout=15000,
+        )
+    except Exception:
+        pass  # fall through and try anyway; save_debug will show why
+
+    # 1) FB tags the actual full-size photo with this attribute
+    try:
+        srcs = page.eval_on_selector_all(
+            "img[data-visualcompletion='media-vc-image']",
+            "els => els.map(e => e.src).filter(Boolean)"
+        )
+        if srcs:
+            return srcs[0]
+    except Exception:
+        pass
+
+    # 2) fallback: largest fully-loaded image referencing FB's CDN
     try:
         srcs = page.eval_on_selector_all(
             "img",
             """els => els
-                .filter(e => e.naturalWidth > 400 && e.src && e.src.includes('scontent'))
+                .filter(e => e.complete && e.naturalWidth > 400 &&
+                             e.src && (e.src.includes('scontent') || e.src.includes('fbcdn')))
                 .sort((a, b) => (b.naturalWidth * b.naturalHeight) - (a.naturalWidth * a.naturalHeight))
                 .map(e => e.src)"""
         )
@@ -299,11 +379,22 @@ def main():
                 log(f"   failed to open photo page: {e}")
                 continue
 
+            if looks_like_login_wall(page):
+                log("   !! this looks like a login/checkpoint wall -- storage_state "
+                    "cookies are likely missing or expired. saving debug and skipping.")
+                save_debug(page, fbid, tag="loginwall")
+                continue
+
+            if not DEBUG_ONLY_FAILURES:
+                save_debug(page, fbid)
+
             img_url = extract_image_url(page)
             caption = extract_caption(page)
 
             if not img_url:
                 log("   no image found, skipping")
+                if DEBUG_ONLY_FAILURES:
+                    save_debug(page, fbid, tag="noimage")
                 continue
 
             ext = ".jpg"
