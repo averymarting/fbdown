@@ -65,6 +65,26 @@ def log(msg):
 
 
 # ---------------- Google Sheets (write) ----------------
+def with_retries(fn, *args, attempts=5, base_delay=5, **kwargs):
+    """Retries a Google API call on transient network/SSL errors with
+    exponential backoff. Rebuilds nothing itself -- caller's callable
+    should be idempotent-safe (Sheets appends are, since each retry just
+    re-sends the same batch)."""
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            if attempt == attempts:
+                break
+            delay = base_delay * (2 ** (attempt - 1))
+            log(f"   Sheets API call failed ({e}), retrying in {delay}s "
+                f"[{attempt}/{attempts}]")
+            time.sleep(delay)
+    raise last_err
+
+
 def get_sheets_service(token_json_str):
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
@@ -86,40 +106,53 @@ def get_sheets_service(token_json_str):
 
 def ensure_tab_and_get_id(service, sheet_id, tab_name):
     """Creates the tab if it doesn't exist yet. Returns the sheetId (int)."""
-    meta = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+    meta = with_retries(service.spreadsheets().get(spreadsheetId=sheet_id).execute)
     for s in meta.get("sheets", []):
         if s["properties"]["title"] == tab_name:
             return s["properties"]["sheetId"]
 
     log(f"tab '{tab_name}' not found, creating it")
-    resp = service.spreadsheets().batchUpdate(
-        spreadsheetId=sheet_id,
-        body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]},
-    ).execute()
+    resp = with_retries(
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]},
+        ).execute
+    )
     new_sheet_id = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
 
     # header row
-    service.spreadsheets().values().update(
-        spreadsheetId=sheet_id,
-        range=f"'{tab_name}'!A1:C1",
-        valueInputOption="RAW",
-        body={"values": [["filename", "caption", "source_url"]]},
-    ).execute()
+    with_retries(
+        service.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=f"'{tab_name}'!A1:C1",
+            valueInputOption="RAW",
+            body={"values": [["filename", "caption", "source_url"]]},
+        ).execute
+    )
     return new_sheet_id
 
 
-def append_rows(service, sheet_id, tab_name, rows):
-    """rows: list of [filename, caption, source_url]"""
+def append_rows(service, sheet_id, tab_name, rows, chunk_size=40):
+    """rows: list of [filename, caption, source_url]. Sent in smaller chunks
+    so a single dropped connection doesn't lose the whole batch, and each
+    chunk is retried independently on transient failures."""
     if not rows:
         return
-    service.spreadsheets().values().append(
-        spreadsheetId=sheet_id,
-        range=f"'{tab_name}'!A:C",
-        valueInputOption="RAW",
-        insertDataOption="INSERT_ROWS",
-        body={"values": rows},
-    ).execute()
-    log(f"appended {len(rows)} row(s) to tab '{tab_name}'")
+    total = 0
+    for i in range(0, len(rows), chunk_size):
+        chunk = rows[i:i + chunk_size]
+        with_retries(
+            service.spreadsheets().values().append(
+                spreadsheetId=sheet_id,
+                range=f"'{tab_name}'!A:C",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": chunk},
+            ).execute
+        )
+        total += len(chunk)
+        log(f"   appended {total}/{len(rows)} row(s) so far")
+    log(f"appended {total} row(s) to tab '{tab_name}'")
 
 
 # ---------------- scraping (Playwright) ----------------
