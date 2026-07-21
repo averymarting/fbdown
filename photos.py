@@ -270,21 +270,34 @@ async def looks_like_login_wall(page):
 # human would read it, but substitutes emoji <img alt="..."> elements
 # with their actual emoji character instead of skipping them (which is
 # what plain innerText does -- FB renders emoji as images, not text).
+#
+# IMPORTANT: this must be ONE self-contained function expression (the
+# helper nested inside), not a function declaration concatenated in
+# front of a separate arrow function. The previous version prepended
+# `function emojiAwareText(){...}` as its own statement before the
+# `(els) => ...` arrow function string -- Playwright's expression
+# wrapping choked on that two-statement string and threw, which the
+# bare `except: texts = []` around every call site swallowed silently.
+# That silent failure is why captions went empty for every photo after
+# the emoji fix, not a Facebook-side change.
 _EMOJI_AWARE_TEXT_JS = """
-function emojiAwareText(el) {
-    let result = '';
-    for (const node of el.childNodes) {
-        if (node.nodeType === Node.TEXT_NODE) {
-            result += node.textContent;
-        } else if (node.nodeType === Node.ELEMENT_NODE) {
-            if (node.tagName === 'IMG' && node.alt) {
-                result += node.alt;
-            } else {
-                result += emojiAwareText(node);
+(els) => {
+    function emojiAwareText(el) {
+        let result = '';
+        for (const node of el.childNodes) {
+            if (node.nodeType === Node.TEXT_NODE) {
+                result += node.textContent;
+            } else if (node.nodeType === Node.ELEMENT_NODE) {
+                if (node.tagName === 'IMG' && node.alt) {
+                    result += node.alt;
+                } else {
+                    result += emojiAwareText(node);
+                }
             }
         }
+        return result;
     }
-    return result;
+    return els.map(e => emojiAwareText(e).trim()).filter(t => t.length > 0);
 }
 """
 
@@ -355,13 +368,9 @@ async def extract_caption(page):
     ]
     for sel in priority_selectors:
         try:
-            texts = await page.eval_on_selector_all(
-                sel,
-                _EMOJI_AWARE_TEXT_JS + """
-                (els) => els.map(e => emojiAwareText(e).trim()).filter(t => t.length > 0)
-                """
-            )
-        except Exception:
+            texts = await page.eval_on_selector_all(sel, _EMOJI_AWARE_TEXT_JS)
+        except Exception as e:
+            log(f"   [caption] selector '{sel}' extraction failed: {e}")
             texts = []
         for t in texts:
             cleaned = _clean_caption_text(t)
@@ -371,11 +380,10 @@ async def extract_caption(page):
     try:
         texts = await page.eval_on_selector_all(
             "div[dir='auto'], span[dir='auto']",
-            _EMOJI_AWARE_TEXT_JS + """
-            (els) => els.map(e => emojiAwareText(e).trim()).filter(t => t.length > 0)
-            """
+            _EMOJI_AWARE_TEXT_JS,
         )
-    except Exception:
+    except Exception as e:
+        log(f"   [caption] fallback dir='auto' extraction failed: {e}")
         texts = []
 
     candidates = [c for c in (_clean_caption_text(t) for t in texts) if c]
