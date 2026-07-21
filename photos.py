@@ -266,6 +266,33 @@ async def looks_like_login_wall(page):
     return any(m in body_text for m in login_markers)
 
 
+async def expand_see_more(page):
+    """FB truncates long captions inline with a clickable 'See more'
+    toggle ('...Y… See more'). Without clicking it, extract_caption only
+    ever sees the truncated preview text. Find and click any such
+    toggle before extracting the caption so we get the full text.
+
+    We match on exact trimmed text ('see more', or with a leading
+    ellipsis) rather than a loose substring match, so we don't
+    accidentally click some larger unrelated container that merely
+    contains the words "see more" somewhere inside it.
+    """
+    try:
+        candidates = page.get_by_text("See more", exact=False)
+        count = await candidates.count()
+    except Exception:
+        return
+    for i in range(min(count, 5)):  # cap -- there should only be one real toggle
+        try:
+            el = candidates.nth(i)
+            text = (await el.inner_text()).strip().lower()
+            if text in ("see more", "... see more", "…see more", "… see more"):
+                await el.click(timeout=2000)
+                await page.wait_for_timeout(600)
+        except Exception:
+            continue
+
+
 # JS helper: walks an element's children and builds its text the way a
 # human would read it, but substitutes emoji <img alt="..."> elements
 # with their actual emoji character instead of skipping them (which is
@@ -325,6 +352,14 @@ def _clean_caption_text(t):
     raw = t.strip()
     low = raw.lower()
 
+    # FB's post meta-line (timestamp + privacy icon) is character-scrambled
+    # for anti-scraping, but the trailing privacy label itself is always
+    # literal, unscrambled text -- e.g. "...M7:300J410805acyaAg · Shared
+    # with Public". That's a reliable tell that the whole block is the
+    # meta line, not a real caption, regardless of how the scrambled part
+    # looks. Reject on sight.
+    if 'shared with' in low or low.endswith('· public') or low.endswith('· friends'):
+        return None
     if _looks_like_scrambled_timestamp(raw):
         return None
     if low in CAPTION_BLOCKLIST:
@@ -467,6 +502,7 @@ async def process_photo(context, fbid, url, idx, total, sem):
             if not DEBUG_ONLY_FAILURES:
                 await save_debug(page, fbid)
 
+            await expand_see_more(page)
             img_url = await extract_image_url(page)
             caption = await extract_caption(page)
 
